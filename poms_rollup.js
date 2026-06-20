@@ -10,11 +10,12 @@ import express from 'express';
 
 // ===== 설정 (컬럼/그룹 ID는 복사본 공통) =====
 const TOKEN = process.env.MONDAY_TOKEN;
-const VERSION = 'v3-agnostic';
+const VERSION = 'v4-chain';
 const PARENT_STATUS_COL = 'color_mm1b2wwc';   // 상위 「그룹 이동」
 const SUB_STATUS_COL = 'status';              // 하위 「상태」
 const SUB_PLAN_COL = 'timerange_mm19wjn0';    // 하위 「계획 일정」
 const SUB_DELAY_COL = 'numeric_mm4gccsa';     // 하위 「지연일」
+const SUB_CHAIN_COL = 'color_mm4gnck6';       // 하위 「계열」(Mold/Press…) — 같은 계열만 밀기
 const PROTECTED_GROUP = 'group_mm29jb8c';     // 고객 일정 — 상태 롤업 제외
 const API = 'https://api.monday.com/v2';
 
@@ -91,17 +92,23 @@ async function clearDelay(subId, subBoard) {
   await gql(`mutation ($b:ID!,$i:ID!){ change_simple_column_value(board_id:$b,item_id:$i,column_id:"${SUB_DELAY_COL}",value:""){id} }`,
     { b: String(subBoard), i: String(subId) });
 }
-// 지연일 입력 하위의 계획 종료일 이후(≥) 시작하는 같은 보드 하위들의 계획 일정 +days
+// 지연일 입력 하위의 계획 종료일 이후(≥) 시작하면서 「계열」이 같은 하위들만 +days
+// (계열 미지정=빈값끼리 한 묶음. 단일 체인 상위는 태깅 없이 그대로 동작)
 async function cascadeDelay(subId, days, subBoard) {
   if (days <= 0 || !subBoard) return;
-  const me = await gql(`query ($id:[ID!]){ items(ids:$id){ column_values(ids:["${SUB_PLAN_COL}"]){text} } }`, { id: [String(subId)] });
-  const myEnd = (me.items?.[0]?.column_values?.[0]?.text || '').split(' - ')[1];
+  const me = await gql(`query ($id:[ID!]){ items(ids:$id){ column_values(ids:["${SUB_PLAN_COL}","${SUB_CHAIN_COL}"]){id text} } }`, { id: [String(subId)] });
+  const mv = me.items?.[0]?.column_values || [];
+  const myEnd = (mv.find(c => c.id === SUB_PLAN_COL)?.text || '').split(' - ')[1];
+  const myChain = mv.find(c => c.id === SUB_CHAIN_COL)?.text || '';
   if (!myEnd) return;
-  const data = await gql(`query ($b:ID!){ boards(ids:[$b]){ items_page(limit:200){ items{ id column_values(ids:["${SUB_PLAN_COL}"]){text} } } } }`, { b: String(subBoard) });
+  const data = await gql(`query ($b:ID!){ boards(ids:[$b]){ items_page(limit:200){ items{ id column_values(ids:["${SUB_PLAN_COL}","${SUB_CHAIN_COL}"]){id text} } } } }`, { b: String(subBoard) });
   let moved = 0;
   for (const it of data.boards[0].items_page.items) {
     if (String(it.id) === String(subId)) continue;
-    const [s, e] = (it.column_values?.[0]?.text || '').split(' - ');
+    const cv = it.column_values || [];
+    const chain = cv.find(c => c.id === SUB_CHAIN_COL)?.text || '';
+    if (chain !== myChain) continue;            // 같은 계열만 밀기
+    const [s, e] = (cv.find(c => c.id === SUB_PLAN_COL)?.text || '').split(' - ');
     if (!s || !e) continue;
     if (s >= myEnd) {
       await gql(`mutation ($b:ID!,$i:ID!,$v:JSON!){ change_column_value(board_id:$b,item_id:$i,column_id:"${SUB_PLAN_COL}",value:$v){id} }`,
@@ -109,7 +116,7 @@ async function cascadeDelay(subId, days, subBoard) {
       moved++;
     }
   }
-  console.log(`[cascade] sub ${subId} +${days}d on board ${subBoard} -> ${moved} shifted`);
+  console.log(`[cascade] sub ${subId} +${days}d chain="${myChain}" -> ${moved} shifted`);
 }
 
 // ===== 웹훅 등록 (CLI) =====
