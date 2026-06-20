@@ -1,0 +1,15 @@
+{
+  "name": "poms-rollup",
+  "version": "1.0.0",
+  "description": "POMS 상위 상태 자동 롤업 (하위 상태 → 상위 그룹이동)",
+  "type": "module",
+  "main": "poms_rollup.js",
+  "scripts": {
+    "start": "node poms_rollup.js",
+    "backfill": "node poms_rollup.js backfill"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

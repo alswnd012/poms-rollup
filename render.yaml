@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: poms-rollup
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node poms_rollup.js
+    envVars:
+      - key: MONDAY_TOKEN
+        sync: false
