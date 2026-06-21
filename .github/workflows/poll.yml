@@ -1,0 +1,11 @@
+name: POMS poll
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+    workflow_dispatch: {}
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: hit /scan
+        run: curl -fsS --max-time 180 https://poms-rollup.onrender.com/scan || true
