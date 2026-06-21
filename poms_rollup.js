@@ -10,7 +10,7 @@ import express from 'express';
 
 // ===== 설정 (컬럼/그룹 ID는 복사본 공통) =====
 const TOKEN = process.env.MONDAY_TOKEN;
-const VERSION = 'v6-poll';
+const VERSION = 'v7-poll-lock';
 const WORKSPACE_ID = 3026437;                 // 영업기획팀 — 이 워크스페이스의 POMS 보드 전체를 폴링
 const SUBTASKS_COL = 'subtasks_mm19mc0g';     // 상위 「하위 아이템」 컬럼 → 하위 보드 ID 추출
 const PARENT_STATUS_COL = 'color_mm1b2wwc';   // 상위 「그룹 이동」 (이 컬럼 보유 = POMS 보드로 식별)
@@ -254,9 +254,14 @@ function server() {
   app.get('/', (_, res) => res.send('POMS rollup running'));
   app.get('/version', (_, res) => res.send(VERSION));
   // 폴링: 스케줄러(외부 cron)가 주기적으로 호출 → 워크스페이스 POMS 보드 전체 스캔·처리
+  // ⚠️ 동시 실행 차단: 스캔 중 들어온 중복 호출은 건너뜀(같은 지연일 중복 전파 방지)
+  let scanning = false;
   app.get('/scan', async (_, res) => {
+    if (scanning) return res.json({ ok: true, version: VERSION, skipped: 'already-scanning' });
+    scanning = true;
     try { const r = await scanWorkspace(WORKSPACE_ID); res.json({ ok: true, version: VERSION, ...r }); }
     catch (e) { console.error('[scan]', e.message); res.status(500).json({ ok: false, error: e.message }); }
+    finally { scanning = false; }
   });
   const port = process.env.PORT || 8080;
   app.listen(port, () => console.log('listening on ' + port));
