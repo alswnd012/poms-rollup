@@ -10,8 +10,10 @@ import express from 'express';
 
 // ===== 설정 (컬럼/그룹 ID는 복사본 공통) =====
 const TOKEN = process.env.MONDAY_TOKEN;
-const VERSION = 'v5-dep';
-const PARENT_STATUS_COL = 'color_mm1b2wwc';   // 상위 「그룹 이동」
+const VERSION = 'v6-poll';
+const WORKSPACE_ID = 3026437;                 // 영업기획팀 — 이 워크스페이스의 POMS 보드 전체를 폴링
+const SUBTASKS_COL = 'subtasks_mm19mc0g';     // 상위 「하위 아이템」 컬럼 → 하위 보드 ID 추출
+const PARENT_STATUS_COL = 'color_mm1b2wwc';   // 상위 「그룹 이동」 (이 컬럼 보유 = POMS 보드로 식별)
 const SUB_STATUS_COL = 'status';              // 하위 「상태」
 const SUB_PLAN_COL = 'timerange_mm19wjn0';    // 하위 「계획 일정」
 const SUB_DELAY_COL = 'numeric_mm4gccsa';     // 하위 「지연일」
@@ -142,6 +144,84 @@ async function cascadeByDependency(triggerId, days, subBoard) {
   console.log(`[cascade-dep] trigger ${T} +${days}d -> ${moved} shifted`);
 }
 
+// ===== 폴링(스캔) — 워크스페이스의 POMS 보드 전체 처리 =====
+// 워크스페이스 내 「그룹 이동(color_mm1b2wwc)」 컬럼을 가진 보드 = POMS 프로젝트로 식별
+async function findPomsBoards(workspaceId) {
+  const out = [];
+  for (let page = 1; page < 50; page++) {
+    const d = await gql(`query ($ws:[ID!],$p:Int!){ boards(workspace_ids:$ws, state:active, limit:100, page:$p){ id columns{ id } } }`, { ws: [String(workspaceId)], p: page });
+    const boards = d.boards || [];
+    if (!boards.length) break;
+    for (const b of boards) if (b.columns?.some(c => c.id === PARENT_STATUS_COL)) out.push(String(b.id));
+    if (boards.length < 100) break;
+  }
+  return out;
+}
+// 상위 보드 → 하위(subitem) 보드 ID
+async function subBoardOf(parentBoardId) {
+  const d = await gql(`query ($id:[ID!]){ boards(ids:$id){ columns(ids:["${SUBTASKS_COL}"]){ settings_str } } }`, { id: [String(parentBoardId)] });
+  const s = d.boards?.[0]?.columns?.[0]?.settings_str;
+  if (!s) return null;
+  try { return String(JSON.parse(s).boardIds?.[0] || '') || null; } catch { return null; }
+}
+// 새 템플릿 식별: 하위 보드에 「선행 작업(종속성)」 컬럼이 있어야 진짜 POMS 프로젝트(레거시/테스트 제외)
+async function subBoardHasDep(subBoard) {
+  const d = await gql(`query ($id:[ID!]){ boards(ids:$id){ columns(ids:["${SUB_DEP_COL}"]){ id } } }`, { id: [String(subBoard)] });
+  return (d.boards?.[0]?.columns?.length || 0) > 0;
+}
+// 하위 보드에서 지연일>0 인 것 처리(클리어 + 종속성 전파)
+async function processDelays(subBoard) {
+  const d = await gql(`query ($b:ID!){ boards(ids:[$b]){ items_page(limit:300){ items{ id column_values(ids:["${SUB_DELAY_COL}"]){text} } } } }`, { b: String(subBoard) });
+  const items = d.boards?.[0]?.items_page?.items || [];
+  let n = 0;
+  for (const it of items) {
+    const delay = asNumber(it.column_values?.[0]?.text || 0);
+    if (delay > 0) {
+      await clearDelay(it.id, subBoard);
+      await cascadeByDependency(it.id, delay, subBoard);
+      n++;
+    }
+  }
+  return n;
+}
+// 상위 보드 전체 롤업 재계산(고객일정 그룹 제외)
+async function rollupBoard(parentBoardId) {
+  const d = await gql(`query ($id:[ID!]){ boards(ids:$id){ items_page(limit:200){ items{ id group{id} column_values(ids:["${PARENT_STATUS_COL}"]){text} subitems{ column_values(ids:["${SUB_STATUS_COL}"]){text} } } } } }`, { id: [String(parentBoardId)] });
+  const items = d.boards?.[0]?.items_page?.items || [];
+  let n = 0;
+  for (const it of items) {
+    if (it.group?.id === PROTECTED_GROUP || !it.subitems?.length) continue;
+    const target = rollup(it.subitems.map(s => s.column_values?.[0]?.text || ''));
+    const cur = it.column_values?.[0]?.text || '';
+    if (target && cur !== target) {
+      await gql(`mutation ($b:ID!,$i:ID!,$v:JSON!){ change_column_value(board_id:$b,item_id:$i,column_id:"${PARENT_STATUS_COL}",value:$v){id} }`,
+        { b: String(parentBoardId), i: String(it.id), v: JSON.stringify({ label: target }) });
+      n++;
+    }
+  }
+  return n;
+}
+async function processBoard(parentBoardId) {
+  const subBoard = await subBoardOf(parentBoardId);
+  if (!subBoard) return { board: parentBoardId, skipped: 'no-subboard' };
+  if (!(await subBoardHasDep(subBoard))) return { board: parentBoardId, skipped: 'not-poms-template' };
+  const delays = await processDelays(subBoard);
+  const rolled = await rollupBoard(parentBoardId);
+  return { board: parentBoardId, subBoard, delays, rolled };
+}
+async function scanWorkspace(workspaceId) {
+  const boards = await findPomsBoards(workspaceId);
+  const results = [];
+  for (const b of boards) {
+    try { results.push(await processBoard(b)); }
+    catch (e) { results.push({ board: b, error: e.message }); }
+  }
+  const delays = results.reduce((s, r) => s + (r.delays || 0), 0);
+  const rolled = results.reduce((s, r) => s + (r.rolled || 0), 0);
+  console.log(`[scan] boards=${boards.length} delays=${delays} rolled=${rolled}`);
+  return { boards: boards.length, delays, rolled, results };
+}
+
 // ===== 웹훅 등록 (CLI) =====
 async function registerWebhook(board, url) {
   if (!board || !url) throw new Error('usage: node poms_rollup.js register-webhook <parentBoardId> <https://.../webhook>');
@@ -173,6 +253,11 @@ function server() {
   });
   app.get('/', (_, res) => res.send('POMS rollup running'));
   app.get('/version', (_, res) => res.send(VERSION));
+  // 폴링: 스케줄러(외부 cron)가 주기적으로 호출 → 워크스페이스 POMS 보드 전체 스캔·처리
+  app.get('/scan', async (_, res) => {
+    try { const r = await scanWorkspace(WORKSPACE_ID); res.json({ ok: true, version: VERSION, ...r }); }
+    catch (e) { console.error('[scan]', e.message); res.status(500).json({ ok: false, error: e.message }); }
+  });
   const port = process.env.PORT || 8080;
   app.listen(port, () => console.log('listening on ' + port));
 }
@@ -181,4 +266,5 @@ function server() {
 if (!TOKEN) { console.error('환경변수 MONDAY_TOKEN 이 필요합니다.'); process.exit(1); }
 const mode = process.argv[2];
 if (mode === 'register-webhook') registerWebhook(process.argv[3], process.argv[4]).then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1); });
+else if (mode === 'scan') scanWorkspace(WORKSPACE_ID).then(r => { console.log(JSON.stringify(r, null, 2)); process.exit(0); }).catch(e => { console.error(e); process.exit(1); });
 else server();
