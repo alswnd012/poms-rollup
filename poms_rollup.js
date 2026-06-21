@@ -10,7 +10,7 @@ import express from 'express';
 
 // ===== 설정 (컬럼/그룹 ID는 복사본 공통) =====
 const TOKEN = process.env.MONDAY_TOKEN;
-const VERSION = 'v8-poll-bg';
+const VERSION = 'v9-rollup-all';
 const WORKSPACE_ID = 3026437;                 // 영업기획팀 — 이 워크스페이스의 POMS 보드 전체를 폴링
 const SUBTASKS_COL = 'subtasks_mm19mc0g';     // 상위 「하위 아이템」 컬럼 → 하위 보드 ID 추출
 const PARENT_STATUS_COL = 'color_mm1b2wwc';   // 상위 「그룹 이동」 (이 컬럼 보유 = POMS 보드로 식별)
@@ -65,7 +65,7 @@ async function recomputeParent(parentId, parentBoard) {
   if (!parentId || !parentBoard) return;
   const d = await gql(`query ($id:[ID!]){ items(ids:$id){ group{id} column_values(ids:["${PARENT_STATUS_COL}"]){text} subitems{ column_values(ids:["${SUB_STATUS_COL}"]){text} } } }`, { id: [String(parentId)] });
   const item = d.items?.[0];
-  if (!item || item.group?.id === PROTECTED_GROUP) return;
+  if (!item) return;
   const target = rollup((item.subitems || []).map(s => s.column_values?.[0]?.text || ''));
   if (!target || (item.column_values?.[0]?.text || '') === target) return;
   await gql(`mutation ($b:ID!,$i:ID!,$v:JSON!){ change_column_value(board_id:$b,item_id:$i,column_id:"${PARENT_STATUS_COL}",value:$v){id} }`,
@@ -190,7 +190,7 @@ async function rollupBoard(parentBoardId) {
   const items = d.boards?.[0]?.items_page?.items || [];
   let n = 0;
   for (const it of items) {
-    if (it.group?.id === PROTECTED_GROUP || !it.subitems?.length) continue;
+    if (!it.subitems?.length) continue;   // 고객 일정 그룹도 값은 갱신(그룹 이동은 자동화가 제외하므로 안 옮겨짐)
     const target = rollup(it.subitems.map(s => s.column_values?.[0]?.text || ''));
     const cur = it.column_values?.[0]?.text || '';
     if (target && cur !== target) {
