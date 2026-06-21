@@ -10,12 +10,12 @@ import express from 'express';
 
 // ===== 설정 (컬럼/그룹 ID는 복사본 공통) =====
 const TOKEN = process.env.MONDAY_TOKEN;
-const VERSION = 'v4-chain';
+const VERSION = 'v5-dep';
 const PARENT_STATUS_COL = 'color_mm1b2wwc';   // 상위 「그룹 이동」
 const SUB_STATUS_COL = 'status';              // 하위 「상태」
 const SUB_PLAN_COL = 'timerange_mm19wjn0';    // 하위 「계획 일정」
 const SUB_DELAY_COL = 'numeric_mm4gccsa';     // 하위 「지연일」
-const SUB_CHAIN_COL = 'color_mm4gnck6';       // 하위 「계열」(Mold/Press…) — 같은 계열만 밀기
+const SUB_DEP_COL = 'dependency_mm4h7x2';     // 하위 「선행 작업(종속성)」 — 전파 그래프의 선행 링크
 const PROTECTED_GROUP = 'group_mm29jb8c';     // 고객 일정 — 상태 롤업 제외
 const API = 'https://api.monday.com/v2';
 
@@ -78,6 +78,9 @@ function addDays(ymd, n) {
   dt.setUTCDate(dt.getUTCDate() + n);
   return dt.toISOString().slice(0, 10);
 }
+function dayDiff(a, b) {                       // b - a (일수, YYYY-MM-DD)
+  return Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / 86400000);
+}
 function asNumber(v) {
   if (v == null) return 0;
   if (typeof v === 'object') v = v.value ?? v.number ?? '';
@@ -92,31 +95,51 @@ async function clearDelay(subId, subBoard) {
   await gql(`mutation ($b:ID!,$i:ID!){ change_simple_column_value(board_id:$b,item_id:$i,column_id:"${SUB_DELAY_COL}",value:""){id} }`,
     { b: String(subBoard), i: String(subId) });
 }
-// 지연일 입력 하위의 계획 종료일 이후(≥) 시작하면서 「계열」이 같은 하위들만 +days
-// (계열 미지정=빈값끼리 한 묶음. 단일 체인 상위는 태깅 없이 그대로 동작)
-async function cascadeDelay(subId, days, subBoard) {
+// 「선행 작업(종속성)」 그래프를 읽어, 트리거를 +days 밀고 후행들을 수렴 규칙으로 전파.
+// 각 후행 S의 이동량 = max(0, max(선행 새 종료) - max(선행 옛 종료)).
+//  → 간격·기간 보존, "늦게 끝나는 선행" 기준(병렬 케이스가 합쳐지는 조립 T0 등 수렴 정확).
+async function cascadeByDependency(triggerId, days, subBoard) {
   if (days <= 0 || !subBoard) return;
-  const me = await gql(`query ($id:[ID!]){ items(ids:$id){ column_values(ids:["${SUB_PLAN_COL}","${SUB_CHAIN_COL}"]){id text} } }`, { id: [String(subId)] });
-  const mv = me.items?.[0]?.column_values || [];
-  const myEnd = (mv.find(c => c.id === SUB_PLAN_COL)?.text || '').split(' - ')[1];
-  const myChain = mv.find(c => c.id === SUB_CHAIN_COL)?.text || '';
-  if (!myEnd) return;
-  const data = await gql(`query ($b:ID!){ boards(ids:[$b]){ items_page(limit:200){ items{ id column_values(ids:["${SUB_PLAN_COL}","${SUB_CHAIN_COL}"]){id text} } } } }`, { b: String(subBoard) });
-  let moved = 0;
-  for (const it of data.boards[0].items_page.items) {
-    if (String(it.id) === String(subId)) continue;
-    const cv = it.column_values || [];
-    const chain = cv.find(c => c.id === SUB_CHAIN_COL)?.text || '';
-    if (chain !== myChain) continue;            // 같은 계열만 밀기
-    const [s, e] = (cv.find(c => c.id === SUB_PLAN_COL)?.text || '').split(' - ');
-    if (!s || !e) continue;
-    if (s >= myEnd) {
-      await gql(`mutation ($b:ID!,$i:ID!,$v:JSON!){ change_column_value(board_id:$b,item_id:$i,column_id:"${SUB_PLAN_COL}",value:$v){id} }`,
-        { b: String(subBoard), i: String(it.id), v: JSON.stringify({ from: addDays(s, days), to: addDays(e, days) }) });
-      moved++;
+  const data = await gql(`query ($b:ID!){ boards(ids:[$b]){ items_page(limit:300){ items{ id column_values(ids:["${SUB_PLAN_COL}","${SUB_DEP_COL}"]){ id text ... on DependencyValue { linked_item_ids } } } } } }`, { b: String(subBoard) });
+  const items = data.boards?.[0]?.items_page?.items || [];
+  const oldStart = {}, oldEnd = {}, preds = {};
+  for (const it of items) {
+    const id = String(it.id);
+    const tv = it.column_values.find(c => c.id === SUB_PLAN_COL);
+    const dv = it.column_values.find(c => c.id === SUB_DEP_COL);
+    const [s, e] = (tv?.text || '').split(' - ');
+    if (s && e) { oldStart[id] = s; oldEnd[id] = e; }
+    preds[id] = (dv?.linked_item_ids || []).map(String);
+  }
+  const T = String(triggerId);
+  const shift = { [T]: days };                  // 트리거는 +days 고정
+  const curEnd = id => (oldEnd[id] ? addDays(oldEnd[id], shift[id] || 0) : null);
+  // 반복 완화(임의 DAG에서 수렴까지)
+  for (let pass = 0, changed = true; changed && pass < 100; pass++) {
+    changed = false;
+    for (const id in oldStart) {
+      if (id === T) continue;
+      const ps = (preds[id] || []).filter(p => oldEnd[p]);
+      if (!ps.length) continue;
+      let oldB = null, newB = null;
+      for (const p of ps) {
+        if (oldB === null || oldEnd[p] > oldB) oldB = oldEnd[p];   // 옛 선행 max 종료
+        const ce = curEnd(p);
+        if (newB === null || ce > newB) newB = ce;                 // 새 선행 max 종료
+      }
+      const sh = Math.max(0, dayDiff(oldB, newB));
+      if ((shift[id] || 0) !== sh) { shift[id] = sh; changed = true; }
     }
   }
-  console.log(`[cascade] sub ${subId} +${days}d chain="${myChain}" -> ${moved} shifted`);
+  let moved = 0;
+  for (const id in shift) {
+    const sh = shift[id];
+    if (!sh || !oldStart[id]) continue;
+    await gql(`mutation ($b:ID!,$i:ID!,$v:JSON!){ change_column_value(board_id:$b,item_id:$i,column_id:"${SUB_PLAN_COL}",value:$v){id} }`,
+      { b: String(subBoard), i: id, v: JSON.stringify({ from: addDays(oldStart[id], sh), to: addDays(oldEnd[id], sh) }) });
+    moved++;
+  }
+  console.log(`[cascade-dep] trigger ${T} +${days}d -> ${moved} shifted`);
 }
 
 // ===== 웹훅 등록 (CLI) =====
@@ -142,7 +165,7 @@ function server() {
       const delay = await readDelay(subId);
       if (delay > 0) {
         await clearDelay(subId, ctx.subBoard);
-        await cascadeDelay(subId, delay, ctx.subBoard);
+        await cascadeByDependency(subId, delay, ctx.subBoard);
       } else {
         await recomputeParent(ctx.parentId, ctx.parentBoard);
       }
